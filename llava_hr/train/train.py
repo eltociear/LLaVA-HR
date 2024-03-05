@@ -816,7 +816,48 @@ def preprocess(
 
     return dict(input_ids=input_ids, labels=targets)
 
+def transform_video(buffer):
+    try:
+        buffer = buffer.numpy()
+    except AttributeError:
+        try:
+            buffer = buffer.asnumpy()
+        except AttributeError:
+            print("Both buffer.numpy() and buffer.asnumpy() failed.")
+            buffer = None
+    images_group = list()
+    for fid in range(len(buffer)):
+        images_group.append(Image.fromarray(buffer[fid]).convert('RGB'))
+    del buffer
+    return images_group
+def get_index(num_frames, num_segments):
+    import numpy as np
+    if num_segments > num_frames:
+        offsets = np.array([
+            idx for idx in range(num_frames)
+        ])
+    else:
+        # uniform sampling
+        seg_size = float(num_frames - 1) / num_segments
+        start = int(seg_size / 2)
+        offsets = np.array([
+            start + int(np.round(seg_size * idx)) for idx in range(num_segments)
+        ])
+    return offsets
 
+def preprocess_video(video_path,num_segments=4):
+    from decord import VideoReader, cpu
+    start = 0.0
+    end = 0.0
+    vr = VideoReader(video_path, num_threads=1, ctx=cpu(0))
+    video_len = len(vr)
+    frame_indices = get_index(video_len - 1, num_segments)
+    vr.seek(0)
+    buffer = vr.get_batch(frame_indices)
+    video = transform_video(buffer)
+    return video
+
+n_frame=4
 class LazySupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
 
@@ -877,12 +918,51 @@ class LazySupervisedDataset(Dataset):
                         result = Image.new(pil_img.mode, (height, height), background_color)
                         result.paste(pil_img, ((height - width) // 2, 0))
                         return result
-
                 image = expand2square(image, tuple(int(x * 255) for x in processor.image_mean))
                 image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
             else:
                 image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
 
+            # align with video
+            image = image.unsqueeze(0).repeat(n_frame, 1, 1, 1)
+            sources = preprocess_robust(
+                copy.deepcopy([e["conversations"] for e in sources]),
+                self.data_args)
+            sources = preprocess_multimodal(
+                copy.deepcopy(sources),
+                self.data_args)
+        elif 'video' in sources[0]:
+            modality_token = VISION_TOKEN
+            image_file = self.list_data_dict[i]['video']
+            image_folder = self.data_args.image_folder
+            processor = self.data_args.image_processor
+            video=preprocess_video(os.path.join(image_folder, image_file),num_segments=n_frame)
+            images = []
+            for image in video:
+                # print(os.path.join(image_folder, image_file+'_%d.png'%(1+i*2)))
+                # try:
+                #     image = Image.open(os.path.join(image_folder, image_file+'_%d.png'%(1+i*2))).convert('RGB')
+                # except:
+                #     print(os.path.join(image_folder, image_file+'_%d.png'%(1+i*2)))
+                if self.data_args.image_aspect_ratio == 'pad':
+                    def expand2square(pil_img, background_color):
+                        width, height = pil_img.size
+                        if width == height:
+                            return pil_img
+                        elif width > height:
+                            result = Image.new(pil_img.mode, (width, width), background_color)
+                            result.paste(pil_img, (0, (width - height) // 2))
+                            return result
+                        else:
+                            result = Image.new(pil_img.mode, (height, height), background_color)
+                            result.paste(pil_img, ((height - width) // 2, 0))
+                            return result
+                    image = expand2square(image, tuple(int(x * 255) for x in processor.image_mean))
+                    image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+                else:
+                    image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+                images.append(image)
+            image=torch.stack(images,0)
             sources = preprocess_robust(
                 copy.deepcopy([e["conversations"] for e in sources]),
                 self.data_args)
@@ -919,7 +999,7 @@ class LazySupervisedDataset(Dataset):
         elif self.data_args.is_multimodal:
             # image does not exist in the data, but the model is multimodal
             crop_size = self.data_args.image_processor.crop_size
-            data_dict['image'] = torch.zeros(3, crop_size['height'], crop_size['width'])
+            data_dict['image'] = torch.zeros(n_frame,3, crop_size['height'], crop_size['width'])
         return data_dict
 
 
@@ -949,10 +1029,13 @@ class DataCollatorForSupervisedDataset(object):
 
         if 'image' in instances[0]:
             images = [instance['image'] for instance in instances]
+            # print(len(images))
+            # print(images[0].shape)
             if all(x is not None and x.shape == images[0].shape for x in images):
                 batch['images'] = torch.stack(images)
             else:
                 batch['images'] = images
+            # print(batch['images'].shape)
 
         return batch
 

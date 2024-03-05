@@ -128,7 +128,7 @@ class MultiPathCLIPVisionTower(nn.Module):
         self.splits = self.select_layer // 100 if self.select_layer > 100 else 1
         self.enable_adapter= not args.freeze_vision
         self.image_size=args.input_image_size
-
+        self.pool=nn.AvgPool2d(4,4)
 
         if self.enable_adapter:
             self.align_stages_latent = nn.ModuleList([S2FStitchAlignModuleV2(self.fast_vision_tower.hidden_size,
@@ -149,6 +149,10 @@ class MultiPathCLIPVisionTower(nn.Module):
         self.is_loaded = True
 
     def forward(self, x):
+        if x.dim()==4:
+            x=x.unsqueeze(1).repeat(1,4,1,1,1)
+        bs,nf,c,h,w=x.shape
+        x=x.view(bs*nf,c,h,w)
 
         # fast & slow brach
         fast_blk = self.fast_vision_tower.vision_tower.vision_model.encoder.layers
@@ -157,7 +161,7 @@ class MultiPathCLIPVisionTower(nn.Module):
         assert len(fast_blk) == n_blks * 4
 
         # pre-process for fast_vision_towe
-        fast_image_size=max(int(self.image_size/32*14),336)
+        fast_image_size=max(int(self.image_size/32*14),224)
         y = F.interpolate(x.float(), size=(fast_image_size, fast_image_size), mode='bilinear', align_corners=True).to(dtype=x.dtype)
         y = self.fast_vision_tower.vision_tower.vision_model.embeddings(y)
         y = self.fast_vision_tower.vision_tower.vision_model.pre_layrnorm(y[:, 1:])
@@ -223,7 +227,17 @@ class MultiPathCLIPVisionTower(nn.Module):
 
         #features combination
         y = self.align_stages[0](y, x)
+        bs_, l, c = y.shape
+        y = y.view(bs, nf*l, c)
 
+        ############### sparial & temperoal pooling
+        # bs_,l,c=y.shape
+        # feat_size=int(math.sqrt(l))
+        # y=y.view(bs,nf,l,c)
+        # y_spatial=y.view(bs,nf,l,c).mean(1)
+        # y_temperoal=y.transpose(1,2).contiguous().view(bs_,c,feat_size,feat_size)
+        # y_temperoal=self.pool(y_temperoal).view(bs_,c,-1).transpose(1,2).contiguous().view(bs,-1,c)
+        # y=torch.cat([y_spatial,y_temperoal],1)
         return y
 
     def forward_features(self, x):
